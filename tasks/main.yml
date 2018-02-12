@@ -1,0 +1,375 @@
+---
+#========================
+# File tasks/main.yml
+#
+# Description: Creates a dark server
+#
+# Author: Derek 'dRock' Halsey
+#========================
+
+- name: FILE | Ensure temporary directory is present
+  file:
+    path: "{{ dark_server.temp_dir }}"
+    state: directory
+
+- name: APT | Install openvpn and unzip
+  become: true
+  become_user: root
+  apt:
+    name: "{{ item }}"
+    state: present
+  with_items:
+  - openvpn
+  - unzip
+  - iptables-persistent
+
+- name: TEMPLATE | configure systemd service for openvpn
+  become: true
+  become_user: root
+  template:
+    src: openvpn.service.j2
+    dest: /etc/systemd/system/openvpn@openvpn.service
+    owner: root
+    group: root
+
+- name: SYSTEMD | Enable the openvpn service
+  become: true
+  become_user: root
+  systemd:
+    daemon_reload: true
+    enabled: true
+    name: openvpn@openvpn.service
+
+- name: UNARCHIVE | Download and extract PIA certs
+  unarchive:
+    src: https://www.privateinternetaccess.com/openvpn/openvpn.zip
+    dest: "{{ dark_server.temp_dir }}"
+    remote_src: true
+
+
+- name: COPY | Move the extracted certs to /etc/openvpn
+  become: true
+  become_user: root
+  copy:
+    src: "{{ item }}"
+    dest: /etc/openvpn
+    remote_src: true
+  with_items:
+  - "{{ dark_server.temp_dir }}/crl.rsa.2048.pem"
+  - "{{ dark_server.temp_dir }}/ca.rsa.2048.crt"
+
+- name: TEMPLATE | Template out openvpn configuration file
+  become: true
+  become_user: root
+  template:
+    src: openvpn.conf.j2
+    dest: /etc/openvpn/openvpn.conf
+    owner: root
+    group: root
+
+- name: TEMPLATE | Template out PIA login credentials
+  become: true
+  become_user: root
+  template:
+    src: login.txt.j2
+    dest: /etc/openvpn/login.txt
+    owner: root
+    group: root
+    mode: "u=rw,g=,o="
+
+- name: LINEINFILE | Update DNS in openvpn update-resolv-conf script
+  become: true
+  become_user: root
+  lineinfile:
+    path: /etc/openvpn/update-resolv-conf
+    regexp: "{{ item.regexp }}"
+    line: "{{ item.line }}"
+  with_items:
+  - { regexp: 'foreign_option_1', line: "foreign_option_1='dhcp-option DNS {{ dark_server.dns.one }}'" }
+  - { regexp: 'foreign_option_2', line: "foreign_option_2='dhcp-option DNS {{ dark_server.dns.two }}'" }
+  - { regexp: 'foreign_option_3', line: "foreign_option_3='dhcp-option DNS {{ dark_server.dns.three }}'" }
+
+- name: USER | Add VPN user
+  become: true
+  become_user: root
+  user:
+    name: vpn
+    groups: samba
+
+- name: SHELL | Flush IP tabels and append new rules
+  become: true
+  become_user: root
+  command: "{{ item }}"
+  with_items:
+  - 'iptables -F'
+  - 'iptables -A OUTPUT ! -o lo -m owner --uid-owner vpn -j DROP'
+  - 'sudo netfilter-persistent save'
+
+- name: TEMPLATE | Template out VPN user IP tables, routing rules, and config Change Reverse Path Filtering
+  become: true
+  become_user: root
+  template:
+    src: "{{ item.src }}"
+    dest: "{{ item.dest }}"
+    owner: root
+    group: root
+    mode: "{{ item.mode }}"
+  with_items:
+  - { src: iptables.sh.j2, dest: /etc/openvpn/iptables.sh, mode: "u=rwx,g=rx,o=rx" }
+  - { src: routing.sh.j2, dest: /etc/openvpn/routing.sh, mode: "u=rwx,g=rx,o=rx" }
+  - { src: 9999-vpn.conf.j2, dest: /etc/sysctl.d/9999-vpn.conf, mode: "u=rw,g=r,o=r" }
+
+- name: LINEINFILE | Configure Split Tunnel VPN Routing
+  become: true
+  become_user: root
+  lineinfile:
+    path: /etc/iproute2/rt_tables
+    line: "200	vpn"
+    mode: "u=rw,g=r,o=r"
+
+- name: FILE | ensure correct permissions on /etc/sysctl.d/
+  become: true
+  become_user: root
+  file:
+    path: /etc/sysctl.d/
+    state: directory
+    owner: root
+    group: root
+    mode: "u=rwx,g=rx,o=rx"
+
+- name: SHELL | Apply rules
+  become: true
+  become_user: root
+  command: sysctl -p
+
+- name: APT_REPOSITORY | Add PPA repository for deluge
+  become: true
+  become_user: root
+  apt_repository:
+    repo: 'ppa:deluge-team/ppa'
+    update_cache: true
+
+- name: APT | Install deluge
+  become: true
+  become_user: root
+  apt:
+    name: "{{ item }}"
+    state: present
+    update_cache: true
+  with_items:
+  - deluged
+  - deluge-web
+
+- name: FILE | Create deluge logs directory
+  become: true
+  become_user: root
+  file:
+    path: /var/log/deluge
+    state: directory
+    owner: vpn
+    group: vpn
+    mode: "u=rwx,g=rwx,o="
+
+- name: TEMPLATE | Template logs rotate file and deluge services
+  become: true
+  become_user: root
+  template:
+    src: "{{ item.src }}"
+    dest: "{{ item.dest }}"
+  with_items:
+  - { src: logrotate.d.j2, dest: /etc/logrotate.d/deluge }
+  - { src: deluged.service.j2, dest: /etc/systemd/system/deluged.service }
+  - { src: deluge-web.service.j2, dest: /etc/systemd/system/deluge-web.service }
+
+- name: Check if /home/vpn/.config/deluge/web.conf exists
+  become: true
+  become_user: root
+  stat:
+    path: /home/vpn/.config/deluge/web.conf
+    get_md5: false
+  register: dark_server_webConf
+
+- name: SYSTEMD | Enable and start deluge services. this will generate /home/vpn/.config/deluge/web.conf
+  become: true
+  become_user: root
+  systemd:
+    daemon_reload: true
+    enabled: true
+    name: "{{ item }}"
+    state: started
+  with_items:
+  - deluged.service
+  - deluge-web.service
+  when: not dark_server_webConf.stat.exists
+
+- name: PAUSE | Timing delay to start services
+  pause:
+    seconds: 5
+  when: not dark_server_webConf.stat.exists
+
+- name: SYSTEMD | Stop deluge services to edit /home/vpn/.config/deluge/web.conf
+  become: true
+  become_user: root
+  systemd:
+    daemon_reload: true
+    enabled: true
+    name: "{{ item }}"
+    state: stopped
+  with_items:
+  - deluged.service
+  - deluge-web.service
+  tags:
+    - config
+
+- name: LINEINFILE | Make Deluge Web UI Auto Connect to Deluge Daemon and apply dark theme
+  become: true
+  become_user: root
+  lineinfile:
+    path: /home/vpn/.config/deluge/web.conf
+    regexp: "{{ item.regexp }}"
+    line: "{{ item.line }}"
+  with_items:
+  - { regexp: 'default_daemon', line: "  \"default_daemon\": \"127.0.0.1:58846\"," }
+  - { regexp: 'theme', line: "  \"theme\": \"dark\"," }
+  tags:
+    - config
+
+- name: LINEINFILE | Remove Web UI password
+  become: true
+  become_user: root
+  lineinfile:
+    path: /home/vpn/.config/deluge/web.conf
+    regexp: "{{ item }}"
+    state: absent
+  with_items:
+  - pwd_sha1
+  - pwd_salt
+  tags:
+    - config
+
+- name: LINEINFILE | Set Web UI password
+  become: true
+  become_user: root
+  lineinfile:
+    path: /home/vpn/.config/deluge/web.conf
+    line: "{{ item.line }}"
+    insertafter: "{{ item.insertafter }}"
+    state: present
+  with_items:
+  - { insertafter: "enabled_plugins", line: "  \"pwd_sha1\": \"{{ dark_server.password.sha1 }}\"," }
+  - { insertafter: "interface", line: "  \"pwd_salt\": \"{{ dark_server.password.salt }}\","  }
+  no_log: true
+  tags:
+    - config
+
+- name: LINEINFILE | Configure security settings and download location
+  become: true
+  become_user: root
+  lineinfile:
+    path: /home/vpn/.config/deluge/core.conf
+    line: "{{ item.line }}"
+    regexp: "{{ item.regexp }}"
+    state: present
+  with_items:
+  - { regexp: "upnp", line: "  \"upnp\": false," }
+  - { regexp: "natpmp", line: "  \"natpmp\": false,"  }
+  - { regexp: "utpex", line: "  \"utpex\": false,"  }
+  - { regexp: "lsd", line: "  \"lsd\": false,"  }
+  - { regexp: "enc_prefer_rc4", line: "  \"enc_prefer_rc4\": true,"  }
+  - { regexp: "download_location", line: "  \"download_location\": \"{{ dark_server.download_dir }}\","  }
+  tags:
+    - config
+
+- name: LINEINFILE | Configure dht security setting
+  become: true
+  become_user: root
+  lineinfile:
+    path: /home/vpn/.config/deluge/core.conf
+    regexp: "\"dht\": true"
+    state: absent
+  tags:
+    - config
+
+
+- name: LINEINFILE | Configure dht security setting
+  become: true
+  become_user: root
+  lineinfile:
+    path: /home/vpn/.config/deluge/core.conf
+    line: "  \"dht\": false,"
+    insertafter: "cache_expiry"
+    state: present
+  tags:
+    - config
+
+- name: SYSTEMD | Start deluge services
+  become: true
+  become_user: root
+  systemd:
+    daemon_reload: true
+    enabled: true
+    name: "{{ item }}"
+    state: started
+  with_items:
+  - deluged.service
+  - deluge-web.service
+
+- name: APT | Install nginx
+  become: true
+  become_user: root
+  apt:
+    name: nginx
+    state: present
+
+- name: FILE | Remove nginx default site from enabled sites
+  become: true
+  become_user: root
+  file:
+    path: /etc/nginx/sites-enabled/default
+    state: absent
+
+- name: TEMPLATE | Configure Deluge Remote Access with nginx Reverse Proxy
+  become: true
+  become_user: root
+  template:
+    src: reverse.j2
+    dest: /etc/nginx/sites-available/reverse
+    owner: root
+    group: root
+    mode: "u=rw,g=r,o=r"
+
+- name: FILE | Add reverse proxy to enabled sites
+  become: true
+  become_user: root
+  file:
+    src: /etc/nginx/sites-available/reverse
+    dest: /etc/nginx/sites-enabled/reverse
+    state: link
+
+- name: SHELL | reboot the system to make changes "stick"
+  become: true
+  become_user: root
+  shell: sleep 2 && shutdown -r now "Ansible updates triggered"
+  async: 1
+  poll: 0
+
+- name: WAIT_FOR | Wait for ssh to resume
+  local_action:
+    module: wait_for
+    port: 22
+    host: "{{ dark_server.network.fqdn }}"
+    delay: 30
+    timeout: 400
+
+- name: FILE | Remove temporary directory
+  file:
+    path: "{{ dark_server.temp_dir }}"
+    state: absent
+
+
+#check configuration
+
+#sudo systemctl status openvpn.service.j2 deluged.service deluge-web.service
+#curl ipinfo.io
+#sudo -u vpn -i -- curl ipinfo.io
+#sudo -u vpn -i -- cat /etc/resolv.conf

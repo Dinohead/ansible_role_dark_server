@@ -1,0 +1,27 @@
+---
+#========================
+# File defaults/main.yml
+#
+# Description: default variables for role
+#
+# Author: Derek 'dRock' Halsey
+#========================
+
+dark_server:
+  temp_dir: /home/{{ ansible_user }}/tmp
+  country: ro
+  downloadDir: /mnt/spok/dev/download
+  password:
+    sha1: "{{ vault.password.sha1 }}"
+    salt: "{{ vault.password.salt }}"
+  pia:
+    username: "{{ vault.pia.username }}"
+    password: "{{ vault.pia.password }}"
+  dns:
+    one: 193.43.27.132
+    two: 193.43.27.133
+    three: 8.8.8.8
+  network:
+    ip: "{{ ansible_default_ipv4.address }}"
+    interface: "{{ ansible_default_ipv4.interface }}"
+    fqdn: "{{ hostvar.fqdn }}"
