@@ -10,6 +10,7 @@
 dark_server:
   temp_dir: /home/user/tmp
   country: ro
+  download_dir: /mnt/spok/dev/download
   password:
     sha1: ""
     salt: ""
